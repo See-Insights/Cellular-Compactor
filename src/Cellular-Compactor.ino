@@ -35,7 +35,7 @@
 
 
 // Particle Product definitions
-PRODUCT_ID(10747);                                   // Connected Counter Header
+PRODUCT_ID(10747);                                  // product ID header
 PRODUCT_VERSION(4);
 #define DSTRULES isDSTusa
 const char releaseNumber[4] = "4";                  // Displays the release on the menu 
