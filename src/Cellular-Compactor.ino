@@ -32,13 +32,15 @@
 // v0.2 - Moved input pins to B1 and B2.  Added a way to detect flashing for for B1 alerts
 // v2.0 - Moving to a more modern construct deviceOS@2.0.1
 // v4.0 - Added a debouncing state to the operation
+// v4.5 - Moving away from interrupt driven.  Putting more focus on debounce.
+// v5.0 - Test for release
 
 
 // Particle Product definitions
 PRODUCT_ID(10747);                                  // product ID header
-PRODUCT_VERSION(4);
+PRODUCT_VERSION(5);
 #define DSTRULES isDSTusa
-const char releaseNumber[4] = "4";                  // Displays the release on the menu 
+const char releaseNumber[6] = "5.00";               // Displays the release on the menu 
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -67,7 +69,7 @@ struct currentCounts_structure {                    // Current values on the dev
   unsigned long lastEventTime;                      // When did we record our last event
   int temperature;                                  // Current Temperature
   int alertCount;                                   // What is the current alert count
-  bool interruptDisconnected;                       // Flag we raise when either input1 or input2 interrupt has been disconnected
+  bool warningFlag;                                 // Flag we raise when either input1 or input2 interrupt has been disconnected
 } current;
 
 
@@ -106,6 +108,7 @@ const int blueLED =           D7;               // This LED is on the Electron i
 // Timing Variables
 unsigned long webhookWait = 45000;              // How long we will wair for a webhook response
 unsigned long resetWait = 30000;                // Honw long we will wait before resetting on an error
+unsigned long pollingFrequency = 10000;         // Poll the sensor states once every 10 seconds.
 unsigned long webhookTimeStamp = 0;             // When did we send the webhook
 unsigned long resetTimeStamp = 0;               // When did the error condition occur
 
@@ -126,7 +129,6 @@ volatile bool input1Flag = false;                                 // ISR will se
 volatile bool input2Flag = false;                                 // ISR will set this flag
 char input1Str[16] = "No Alert";                                  // String to describe the state of the flag in the mobile app and console
 char input2Str[16] = "No Alert";                                  // String to describe the state of the flag
-bool input1ChangeFlag = false;                                    // Let us know if a change is detected
 
 void setup()                                                            // Note: Disconnected Setup()
 {
@@ -199,6 +201,8 @@ void setup()                                                            // Note:
   attachInterrupt(wakeUpPin, watchdogISR, RISING);                      // The watchdog timer will signal us and we have to respond
 
   // The device may have been reset without clearing the alerts.  Here is where we determine that at startup.  After this - tracked by interrupts
+  // For Input 1 - which can be on solid (75%) or flashing we don't attempt to determine flashing here
+  attachInterrupt(input1, input1ISR, FALLING);                          // We need to watch for the input1 in both rising and falling states even if it was on at reset
   if (digitalRead(input1))  {                                           // The input is not in an alert state
     strncpy(input1Str,"No Alert",sizeof(input1Str));
   }
@@ -206,7 +210,7 @@ void setup()                                                            // Note:
     strncpy(input1Str,"75% Full",sizeof(input1Str));
     current.input1 = 2;                                               // Inidication is that we are now 75% full
   }
-  attachInterrupt(input1, input1ISR, FALLING);                          // We need to watch for the input1 in both rising and falling states even if it was on at reset
+  // For input 2 - we can determine its state and decide whether we need to attach the interrupt or not
   if (digitalRead(input2))  {                                           // The input is not in an alert state
     strncpy(input2Str,"No Alert",sizeof(input2Str));
     attachInterrupt(input2, input2ISR, FALLING);                          // On the input2 line, we just need to know when it goes LOW
@@ -214,10 +218,11 @@ void setup()                                                            // Note:
   else {
     strncpy(input2Str,"Low Oil",sizeof(input2Str));
     current.input2 = 1;                                               // Inidication is that we have a low oil alert
-    current.interruptDisconnected = true;
+    current.warningFlag = true;
   }
 
-  takeMeasurements();
+  if (Cellular.ready()) getSignalStrength();                            // Test signal strength if the cellular modem is on and ready
+  getTemperature();
 
   if (state != ERROR_STATE) state = IDLE_STATE;                         // IDLE unless error from above code
 
@@ -227,7 +232,7 @@ void setup()                                                            // Note:
 void loop()
 {
   switch(state) {
-  case IDLE_STATE:
+  case IDLE_STATE: 
     if (state != oldState) publishStateTransition();
     if (input1Flag) state = DEBOUNCE_FULL_STATE;                        // Need to make sure lights are on for sure - harder since full can flash
     if (input2Flag) state = DEBOUNCE_OIL_STATE;                         // Need to make sure lights are on for sure
@@ -236,51 +241,73 @@ void loop()
 
   case DEBOUNCE_FULL_STATE: {                                           // We got here because the input1Flag is high from a hardware interrupt - but is a noise or a signal? and is it flashing
     static unsigned long debounceTimeStamp = 0;
+    static int debounceCount = 0;
 
     if (state != oldState) {
-      debounceTimeStamp = millis();                                     // Start the debounce timer
+      debounceCount = 0;                                                // Zero the debounce count the first time we enter this state from another state
       publishStateTransition();
     }
+    // When we enter this state, we will either have a current.input1 value of 0 (no alert - looking for 75%) or 2 (75% full looking for on solid)
+    if ((millis() - debounceTimeStamp > 100) && current.input1 == 0) {  // More debounce since we are looking for a solid light
+      debounceTimeStamp = millis();
 
-    if ((millis() - debounceTimeStamp > 10000) && current.input1 == 0) {// Wait for 10 seconds unless we are looking for a flashing light if current.input1 = 0 then we are looking for solid on
-      if (!digitalRead(input1)) {                                       // We are looking for the "full" light on and not yet at 75% which is on solid - hence the debounce
-        takeMeasurements();
-        state = REPORTING_STATE;
-      }
+      if (!digitalRead(input1)) debounceCount++;
       else {                                                            // False alarm input is lo longer low 
-        input1Flag = false;
-        state = IDLE_STATE;
+        input1Flag = false;                                             // Reset the interrupt flag
+        state = IDLE_STATE;                                             // Go back to the IDLE_STATE      
+      }
+      
+      if (debounceCount > 100) {                                        // We are looking for 75% which is on solid - hence the 10 second debounce
+        if (takeMeasurements()) {
+          state = REPORTING_STATE;                                      // OK so it is a real signal and it is a change from before then we need to report it
+        }
+        else {
+          input1Flag = false;
+          state = IDLE_STATE;                                        // Must be a blink and we need to count a few more before declaring a shate change - back to IDLE_STATE
+        }
       }
     }
-    else if ((millis() - debounceTimeStamp > 200) && current.input1 ==2) {  // Less debounce since the light should be flashing
-      debounceTimeStamp = millis();                                     // We need to reset as we will be coming back here often
-      if (!digitalRead(input1)) {                                       // Remember we came to this state on a falling interrupt - is it still low?
-        if (takeMeasurements()) state = REPORTING_STATE;                // The input1 is still low so off to takeMeasurements  - if returned true then the light was found to be flashing - if not more flashes needed
-        else state = IDLE_STATE;                                        // Back to the IDLE_STATE until the next flash
+    else if ((millis() - debounceTimeStamp > 50) && current.input1 == 2) {   // Less debounce since the light should be flashing - will debounce for 1/2 second
+      debounceTimeStamp = millis();
+
+      if (!digitalRead(input1)) debounceCount++;
+      else {                                                            // False alarm input is lo longer low 
+        input1Flag = false;                                             // Reset the interrupt flag
+        state = IDLE_STATE;                                             // Go back to the IDLE_STATE      
       }
-      else {
-        input1Flag = false;                                             // False alarm must have been noise - not flashing
-        state = IDLE_STATE;   
+      
+      if (debounceCount > 10) {                                         // We are looking for the "full" light on  hence the shorter debounce
+        if (takeMeasurements()) {
+          state = REPORTING_STATE;                                      // OK so it is a real signal and it is a change from before then we need to report it
+        }
+        else {
+          input1Flag = false;
+          state = IDLE_STATE;                                           // Must be a blink and we need to count a few more before declaring a shate change - back to IDLE_STATE
+        }
       }
     }
     } break;
 
   case DEBOUNCE_OIL_STATE: {                                            // We got here because the input2Flag is high from a hardware interrupt - but is a noise or a signal?
       static unsigned long debounceTimeStamp = 0;
+      static int debounceCount = 0;
 
       if (state != oldState) {
-        debounceTimeStamp = millis();                                     // Start the debounce timer
+        debounceCount = 0;                                              // We are going to reset the counter as we enter this state for the first time
         publishStateTransition();
       }
 
-      if (millis() - debounceTimeStamp > 10000) {                         // Wait for 10 seconds unless we are looking for a flashing light
-        if (!digitalRead(input2)) {                                       // Low oil light is on (assert low) and we have not yet set this alert
-          takeMeasurements();                                             // This will take measurements and set the flags
-          state = REPORTING_STATE;                                        // We need to report the change in alert level
+      if (millis() - debounceTimeStamp > 100) {                         // Check the state of this low oil light ten times in a second - all have to show LOW (light on) to pass this state
+        debounceTimeStamp = millis();
+        if (!digitalRead(input2)) debounceCount++;                      // Light is on - check
+        else {                                                          // Must be noice because the low oil light is no longer on
+        input2Flag = false;                                             // Reset the interrupt flag
+        state = IDLE_STATE;                                             // Go back to the IDLE_STATE        
         }
-        else {
-          input2Flag = false;                                             // False alarm the input is no longer low - remember there is no alert flag once low oil is on
-          state = IDLE_STATE;
+
+        if (debounceCount > 100) {                                      // Low oil light is on (assert low) and we have not yet set this alert - it will take 10 seconds to reach this state
+          takeMeasurements();                                           // This will take measurements and set the flags
+          state = REPORTING_STATE;                                      // We need to report the change in alert level
         }
       } 
     } break;
@@ -290,7 +317,6 @@ void loop()
     if (!sysStatus.connectedStatus) connectToParticle();                // Only attempt to connect if not already New process to get connected
     if (Particle.connected()) {
       if (Time.hour() == 0) dailyCleanup();                             // Once a day, clean house
-      takeMeasurements();                                               // Update Temp, Battery and Signal Strength values
       sendEvent();                                                      // Send data to Ubidots
       state = RESP_WAIT_STATE;                                          // Wait for Response
     }
@@ -338,7 +364,7 @@ void loop()
   // Main loop housekeeping
   if (watchdogFlag) petWatchdog();
 
-  if (current.interruptDisconnected) flashLED();                      // Signal that at least one interrupt is disconnected
+  if (current.warningFlag) flashLED();                      // Signal that at least one interrupt is disconnected
 
   if (systemStatusWriteNeeded) {                                      // Batch write updates to FRAM
     fram.put(FRAM::systemStatusAddr,sysStatus);
@@ -351,9 +377,7 @@ void loop()
 }
 
 // Take measurements
-bool takeMeasurements() {                                               // For clarity - 0 = no alert, 1 = alert (), 2 = 75% full and is flashing - Returns "True" if flashing
-  const int cyclesRequired = 5;                                         // How many cycles will we need to count?
-  static int cycleCount = 0;
+bool takeMeasurements() {                                               // We get to this function only after a debounced interrupt (LOW) as indicated by interrupt flags
   // input1 & input2 - are both inverted when the indicator light is off the input pin will go high
   // input1 - capacity light sensor - HIGH = 0 / no alert, FLASHING = 1 / 100% full, LOW = 2 / 75% full
   // input2 - oil light sensor - HIGH = 0 / no alert, LOW = 1 / alert
@@ -361,42 +385,58 @@ bool takeMeasurements() {                                               // For c
   // When either input is disconnected, we will start flashing the Electron Blue LED
 
   // Resolve input1 flags, interrupts and alerts
-  if (input1Flag) {                                                     // input1 triggered an interrupt on FALLING
-    if (!cycleCount) {                                                  // First interrupt and the Light is ON (input1 = LOW)
+  if (input1Flag) {                                                     // input1 triggered an interrupt on LOW - and was debounced
+    input1Flag = false;
+    const int cyclesRequired = 5;                                       // How many cycles will we need to count?
+    static int cycleCount = 0;
+    static unsigned long cycleCountStarted = millis();  
+
+    if ((millis() - cycleCountStarted > 15000) && current.input1 == 2) {  // What happens if we are on 75% full already and looking to see if flashing and it has been too long (giving 15 seconds for 5 cycles)
+      cycleCount = 0;                                                   // Reset the cycle counts 
+      cycleCountStarted = millis();
+      return false;                                                     // No valid change to report as the cycle counting was stale - go back and try again
+    }
+
+    if (!cycleCount && current.input1 == 0) {                           // First interrupt and the Light is ON (input1 = LOW)
       current.input1 = 2;                                               // Inidication is that we are now 75% full
       strncpy(input1Str,"75% Full",sizeof(input1Str));
       cycleCount++;                                                     // Start counting cycles
+      cycleCountStarted = millis();                                     // Start the timer to reset cycleCount if too much time has passed
+      currentStatusWriteNeeded = true;
+      return true;                                                      // We have a change to report
     }
-    else if (cycleCount < cyclesRequired) cycleCount++;                 // Increment the counter
+    else if (cycleCount < cyclesRequired) {
+      cycleCount++;                                                     // Increment the counter
+      return false;                                                     // No change in state - return false
+    }
     else if (cycleCount >= cyclesRequired) {                            // We have reached our cycle limit
       current.input1 = 1;                                               // We are at 100% full the light is flashing
       strncpy(input1Str,"100% Full",sizeof(input1Str));
-      detachInterrupt(input1);                                          // Stop monitoring the input - wait for reset
-      current.interruptDisconnected = true;                             // Set the interrupt disconnected flag which will trigger the blue flashing LED
+      current.warningFlag = true;                                       // Set the interrupt disconnected flag which will trigger the blue flashing LED
+      currentStatusWriteNeeded = true;
+      detachInterrupt(input1);                                          // Will stop checking input 1 until a reset.                                  
+      return true;                                                      // We have a change to report
     }
-    input1Flag = false;
   }
 
   // Resolve input2 flags, interrupts and alerts
-  if (input2Flag) {                                                     // input1 triggered an interrupt by going LOW this is an alert
+  if (input2Flag) {                                                     // input2 triggered an interrupt by going LOW this is an alert
+    input2Flag = false;
     current.input2 = 1;                                                 // This is the alert value
     strncpy(input1Str,"Low Oil",sizeof(input1Str));
-    detachInterrupt(input2);                                            // Stop checking until next reset
-    current.interruptDisconnected = true;                               // Set the interrupt disconnected flag which will trigger the blue flashing LED
-    input2Flag = false;
+    current.warningFlag = true;                                         // Set the interrupt disconnected flag which will trigger the blue flashing LED
+    currentStatusWriteNeeded = true;
+    detachInterrupt(input2);                                            // Will stop checking input 2 until a reset.     
+    return true;
   }
 
-  if (Cellular.ready()) getSignalStrength();                            // Test signal strength if the cellular modem is on and ready
-  getTemperature();
-
-  currentStatusWriteNeeded = true;
-  
-  if (current.input1 == 1) return true;                                 // We need to know if flashing was discovered - then we need to report
-  else return false;  
+  return false;                                                         // Never get here, just for compiler
 }
 
 void sendEvent() {                    
   char data[256];                                                       // Store the date in this character array - not global
+  if (Cellular.ready()) getSignalStrength();                            // Test signal strength if the cellular modem is on and ready
+  getTemperature();
   snprintf(data, sizeof(data), "{\"input1\":%i, \"input2\":%i, \"temp\":%i, \"alerts\":%i, \"resets\":%i, \"timestamp\":%lu000}",current.input1, current.input2, current.temperature, current.alertCount, sysStatus.resetCount, Time.now());
   publishQueue.publish("HaulerCaller_Hook", data, PRIVATE);
   dataInFlight = true;                                                  // set the data inflight flag
@@ -461,7 +501,6 @@ void input1ISR() {
   input1Flag = true;
 }
 
-// Here is were we will put the timer and other ISRs
 void input2ISR() {
   input2Flag = true;
 }
@@ -575,7 +614,7 @@ void checkSystemValues() {                                          // Checks to
 void checkCurrentValues() {                                             // Checks to ensure that all system values are in reasonable range
   current.input1 = 0;                                                   // Always reset at startup
   current.input2 = 0;
-  current.interruptDisconnected = 0;                                    // Always false at startup
+  current.warningFlag = 0;                                    // Always false at startup
   if (current.alertCount < 0 || current.alertCount > 254) current.alertCount = 0;
   // None for lastHookResponse
   currentStatusWriteNeeded = true;
