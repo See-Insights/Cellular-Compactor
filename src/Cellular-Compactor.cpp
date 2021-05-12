@@ -40,12 +40,14 @@
 // v4.0 - Added a debouncing state to the operation
 // v4.5 - Moving away from interrupt driven.  Putting more focus on debounce.
 // v5.0 - Test for release
+// v6.00 - Changed to deviceOS@2.1.0 and will force a publish on reboot
 
 
 // Particle Product definitions
 void setup();
 void loop();
 bool takeMeasurements();
+int getInputStates(String command);
 void sendEvent();
 void UbidotsHandler(const char *event, const char *data);
 void getSignalStrength();
@@ -70,11 +72,11 @@ void publishStateTransition(void);
 void fullModemReset();
 int setDSTOffset(String command);
 bool isDSTusa();
-#line 40 "/Users/chipmc/Documents/Maker/Particle/Projects/Cellular-Compactor/src/Cellular-Compactor.ino"
+#line 41 "/Users/chipmc/Documents/Maker/Particle/Projects/Cellular-Compactor/src/Cellular-Compactor.ino"
 PRODUCT_ID(10747);                                  // product ID header
-PRODUCT_VERSION(5);
+PRODUCT_VERSION(6);
 #define DSTRULES isDSTusa
-const char releaseNumber[6] = "5.00";               // Displays the release on the menu 
+const char releaseNumber[6] = "6.00";               // Displays the release on the menu 
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -103,7 +105,7 @@ struct currentCounts_structure {                    // Current values on the dev
   unsigned long lastEventTime;                      // When did we record our last event
   int temperature;                                  // Current Temperature
   int alertCount;                                   // What is the current alert count
-  bool warningFlag;                       // Flag we raise when either input1 or input2 interrupt has been disconnected
+  bool warningFlag;                                 // Flag we raise when either input1 or input2 interrupt has been disconnected
 } current;
 
 
@@ -195,6 +197,7 @@ void setup()                                                            // Note:
   Particle.function("Verbose-Mode",setVerboseMode);
   Particle.function("Set-Timezone",setTimeZone);
   Particle.function("Set-DSTOffset",setDSTOffset);
+  Particle.function("Report-Inputs",getInputStates);
 
   connectToParticle();                                                  // This device is always connected
 
@@ -229,6 +232,7 @@ void setup()                                                            // Note:
   checkCurrentValues();                                                 // Make sure all is good
 
   currentHourlyPeriod = Time.hour();                                    // The local time hourly period for reporting purposes
+  currentHourlyPeriod = 0;                                              // This will force the device to report to Ubidots each time it is rebooted
   
   if (!digitalRead(userSwitch)) loadSystemDefaults();                   // Make sure the device wakes up and connects
 
@@ -465,6 +469,13 @@ bool takeMeasurements() {                                               // We ge
   }
 
   return false;                                                         // Never get here, just for compiler
+}
+
+int getInputStates(String command) {
+  char resultStr[128];
+  snprintf(resultStr, sizeof(resultStr), "Current values input1: %s, input2: %s", digitalRead(input1) ? "high" : "low" , digitalRead(input2) ? "high" : "low");
+  publishQueue.publish("States",resultStr,PRIVATE);
+  return 1;
 }
 
 void sendEvent() {                    
